@@ -1,228 +1,372 @@
-# SPEC — 개발자 포트폴리오 사이트 기술 명세
+# SPEC — 백엔드 개발자 포트폴리오 사이트 기술 명세
 
-> 상태: **초안 (검토 대기)** · 작성일: 2026-10-23
+> 상태: **초안 v2 (검토 대기)** · 작성일: 2026-10-23
 > 요구사항은 [`prd.md`](./prd.md)를 따른다. 기능 ID(F-xx)는 PRD와 동일하다.
+> `[가정]` 표시는 확인이 필요한 항목입니다.
 
 ## 1. 기술 스택
 
-| 영역 | 선택 | 선택 이유 |
-|---|---|---|
-| 프레임워크 | Next.js 15 (App Router) | SSG로 빠른 초기 로딩, SEO 메타데이터 API, 서비스 기업에서 널리 사용 |
-| 언어 | TypeScript (strict) | 타입 안정성, 콘텐츠 스키마 검증 |
-| 스타일 | Tailwind CSS v4 | 디자인 토큰 일관성, 작은 CSS 번들 |
-| 콘텐츠 | MDX + frontmatter (`gray-matter`, `next-mdx-remote`) | 코드 수정 없이 콘텐츠 추가 |
-| 스키마 검증 | Zod | 빌드 시 frontmatter 누락·오타 검출 |
-| 단위 테스트 | Vitest + React Testing Library | 빠른 실행, Jest 호환 API |
-| E2E 테스트 | Playwright | 실제 브라우저 기반 시나리오 검증, 모바일 뷰포트 |
-| 품질 측정 | Lighthouse CI | PRD 성능·접근성 목표 자동 검증 |
-| 린트/포맷 | ESLint, Prettier | 코드 일관성 |
-| 패키지 매니저 | pnpm | 빠른 설치, 엄격한 의존성 |
-| 배포 | Vercel | Next.js 최적화, PR 프리뷰 배포 |
-| CI | GitHub Actions | lint → typecheck → test → build → E2E → Lighthouse |
+버전은 2026-10-23 기준 최신 안정(GA) 버전이며, 개발 착수 시 패치 버전만 갱신한다.
 
-## 2. 디렉터리 구조
+### 1.1 백엔드
+
+| 영역 | 선택 | 비고 |
+|---|---|---|
+| 언어 | Java 25 (LTS) | record, pattern matching, virtual threads 활용 |
+| 프레임워크 | Spring Boot 4.1.x (현재 4.1.2) | Spring Framework 7 기반 |
+| 웹 | Spring Web MVC + Virtual Threads | `spring.threads.virtual.enabled=true` |
+| 영속성 | Spring Data JPA (Hibernate 7) | 조회 성능을 위해 fetch join / `@EntityGraph` 사용 |
+| DB | MySQL 8.4 LTS | utf8mb4 |
+| 마이그레이션 | Flyway | 스키마·시드 데이터 버전 관리 |
+| 보일러플레이트 | Lombok | 엔티티는 `@Getter` + `@NoArgsConstructor(access = PROTECTED)` 중심, `@Data`·`@Setter` 지양 |
+| 검증 | Jakarta Bean Validation | 요청 DTO 검증 |
+| 보안 | Spring Security + JWT | 관리자 1인 인증 |
+| 요청 제한 | Bucket4j | 연락 폼 스팸 방지 |
+| 캐시 | Spring Cache + Caffeine | 공개 조회 API |
+| API 문서 | springdoc-openapi (Swagger UI) | |
+| 운영 | Spring Boot Actuator | `health`, `info`, `metrics` |
+| 빌드 | Gradle (Kotlin DSL) | |
+| 테스트 | JUnit 5, AssertJ, Mockito, Spring Boot Test, **Testcontainers(MySQL)**, JaCoCo | |
+
+### 1.2 프론트엔드
+
+| 영역 | 선택 | 비고 |
+|---|---|---|
+| 프레임워크 | Next.js 16.x (현재 16.4.2), App Router | SSG + ISR, On-demand Revalidation |
+| 언어 | TypeScript (strict) | |
+| 스타일 | Tailwind CSS v4 | |
+| 마크다운 렌더링 | `react-markdown` + `remark-gfm` | 프로젝트 본문은 DB에 Markdown으로 저장 |
+| API 타입 | `openapi-typescript` | 백엔드 OpenAPI 스펙에서 TS 타입 자동 생성 |
+| 테스트 | Vitest + React Testing Library, Playwright, `@axe-core/playwright` | |
+| 품질 | ESLint, Prettier, Lighthouse CI | |
+| 패키지 매니저 | pnpm | |
+
+## 2. 시스템 아키텍처
+
+```
+                 ┌──────────────────────────┐
+  Browser ──────▶│ Next.js (Vercel)         │  https://<domain>
+                 │  - SSG/ISR 페이지          │
+                 │  - /api/revalidate (비공개) │◀──┐ 콘텐츠 변경 시 재검증 요청
+                 └────────────┬─────────────┘   │  (공유 시크릿)
+                              │ 빌드·재검증 시 조회     │
+                              ▼                  │
+  Browser ─(연락 폼 POST)─▶┌──────────────────────┴───┐
+  Admin  ─(JWT)─────────▶│ Spring Boot API (Docker)  │  https://api.<domain>
+                          │  Nginx(TLS) → App         │
+                          └────────────┬─────────────┘
+                                       ▼
+                          ┌──────────────────────────┐
+                          │ MySQL 8.4                │
+                          └──────────────────────────┘
+```
+
+- 공개 페이지는 Next.js가 **빌드·재검증 시점에만** API를 호출하므로, 방문자 트래픽이 API·DB에 직접 가지 않는다.
+- 브라우저가 API를 직접 호출하는 것은 연락 폼 제출(F-11)뿐이다.
+- 관리자가 콘텐츠를 수정하면 API가 트랜잭션 커밋 후(`@TransactionalEventListener(AFTER_COMMIT)`) Next.js `/api/revalidate`에 해당 경로(태그) 재검증을 요청한다 (F-13).
+
+## 3. 저장소 구조 (모노레포)
 
 ```
 .
-├── content/
-│   ├── profile.ts            # 이름, 소개, 연락처 등 (F-01, F-02, F-07)
-│   ├── experience.ts         # 경력 (F-03)
-│   ├── skills.ts             # 기술 스택 (F-06)
-│   └── projects/
-│       └── <slug>.mdx        # 프로젝트 상세 (F-04, F-05)
-├── public/
-│   ├── resume.pdf            # 이력서 (F-08)
-│   └── images/
-├── src/
-│   ├── app/
-│   │   ├── layout.tsx        # 공통 레이아웃, 메타데이터, 폰트
-│   │   ├── page.tsx          # 홈 (Hero, About, Experience, Projects, Skills, Contact)
-│   │   ├── projects/
-│   │   │   └── [slug]/page.tsx   # 프로젝트 상세 (generateStaticParams)
-│   │   ├── not-found.tsx
-│   │   ├── opengraph-image.tsx
-│   │   ├── sitemap.ts
-│   │   └── robots.ts
-│   ├── components/
-│   │   ├── sections/         # Hero, About, Experience, ProjectList, Skills, Contact
-│   │   ├── ui/               # Button, Tag, Card, Section
-│   │   └── layout/           # Header, Footer, MobileNav
-│   ├── lib/
-│   │   ├── content.ts        # MDX 로딩/파싱
-│   │   └── schema.ts         # Zod 스키마
-│   └── types/
-├── tests/
-│   ├── unit/
-│   └── e2e/
-└── .github/workflows/ci.yml
+├── backend/
+│   ├── build.gradle.kts
+│   ├── Dockerfile
+│   └── src/
+│       ├── main/java/<base-package>/
+│       │   ├── PortfolioApplication.java
+│       │   ├── global/              # config, security, exception, cache, revalidation
+│       │   └── domain/
+│       │       ├── profile/         # controller / service / repository / entity / dto
+│       │       ├── experience/
+│       │       ├── project/
+│       │       ├── skill/
+│       │       ├── contact/
+│       │       └── auth/
+│       ├── main/resources/
+│       │   ├── application.yml
+│       │   └── db/migration/        # V1__init.sql, V2__seed.sql ...
+│       └── test/java/...
+├── frontend/
+│   ├── src/
+│   │   ├── app/                     # layout, page, projects/[slug], about-this-site, api/revalidate
+│   │   ├── components/              # sections/, ui/, layout/
+│   │   ├── lib/                     # api client, utils
+│   │   └── types/api.d.ts           # openapi-typescript 생성물
+│   ├── public/resume.pdf
+│   └── tests/{unit,e2e}/
+├── docker-compose.yml               # 로컬: mysql + backend
+├── .github/workflows/
+│   ├── backend-ci.yml
+│   ├── frontend-ci.yml
+│   └── backend-deploy.yml
+├── prd.md
+└── spec.md
 ```
 
-## 3. 페이지 및 라우팅
+- 패키지 구조: 도메인형(`domain/<기능>/...`) — 기능 단위 응집도를 보여 주기 위함
+- base package: `dev.<name>.portfolio` `[가정: 도메인 확정 후 결정]`
+
+## 4. 데이터 모델 (ERD)
+
+```
+profile (1행)
+  id PK, name, role, headline, about(TEXT, Markdown), email,
+  github_url, linkedin_url, blog_url, resume_url, updated_at
+
+keyword                       ← Hero 핵심 키워드 3개
+  id PK, profile_id FK, name, sort_order
+
+experience
+  id PK, company, role, start_date(DATE), end_date(DATE NULL=재직 중),
+  summary, sort_order, created_at, updated_at
+experience_achievement
+  id PK, experience_id FK, content, sort_order
+
+project
+  id PK, slug UNIQUE, title, summary, period_start, period_end, role,
+  thumbnail_url, content(MEDIUMTEXT, Markdown), github_url, demo_url,
+  featured, sort_order, created_at, updated_at
+project_metric
+  id PK, project_id FK, label, before_value NULL, after_value, sort_order
+
+skill_category
+  id PK, name, sort_order               ← Language / Backend / Database / Infra·DevOps / Frontend / Collaboration
+skill
+  id PK, category_id FK, name UNIQUE, level TINYINT(1~5), description, sort_order
+
+project_skill                            ← 프로젝트 기술 태그 (필터 기준)
+  project_id FK, skill_id FK, PK(project_id, skill_id)
+
+contact_message
+  id PK, name, email, message(TEXT), ip_hash, user_agent,
+  status(NEW/READ/ARCHIVED), created_at
+
+admin_user
+  id PK, username UNIQUE, password_hash(BCrypt), created_at
+```
+
+- 프로젝트 기술 태그는 `skill`과 연결해 "스킬 → 사용한 프로젝트" 역방향 조회도 가능하게 한다.
+- `ip_hash`: 원본 IP 대신 SHA-256(IP + salt) 저장 (개인정보 최소화)
+- 엔티티 연관관계는 기본 `LAZY`, 목록 조회는 fetch join / `@EntityGraph` + `default_batch_fetch_size`로 N+1 방지
+- 관리자 계정은 최초 기동 시 환경 변수(`ADMIN_USERNAME`, `ADMIN_PASSWORD`)로 생성
+
+## 5. API 명세
+
+### 5.1 공통
+
+- Base URL: `https://api.<domain>/api/v1`
+- 응답: JSON, 날짜 `YYYY-MM` 또는 ISO-8601
+- 에러 응답: RFC 9457 Problem Details (`ProblemDetail`)
+
+```json
+{
+  "type": "about:blank",
+  "title": "Bad Request",
+  "status": 400,
+  "detail": "입력값이 올바르지 않습니다.",
+  "instance": "/api/v1/contacts",
+  "errors": [{ "field": "email", "message": "이메일 형식이 아닙니다." }]
+}
+```
+
+### 5.2 공개 API (인증 불필요, 캐시 적용)
+
+| Method | Path | 설명 | 기능 |
+|---|---|---|---|
+| GET | `/profile` | 프로필 + 키워드 | F-01, F-02, F-07 |
+| GET | `/experiences` | 경력 목록 (최신순, 성과 포함) | F-03 |
+| GET | `/projects?tag={skillName}` | 프로젝트 목록 (sort_order 순, 태그 필터 다중 = OR) | F-04 |
+| GET | `/projects/{slug}` | 프로젝트 상세 (본문·지표·태그) | F-05 |
+| GET | `/skills` | 카테고리별 스킬 (level 포함) | F-06 |
+| POST | `/contacts` | 연락 메시지 접수 → `201 Created` | F-11 |
+
+`POST /contacts` 규칙
+- 검증: `name` 1~50자, `email` 형식, `message` 10~2000자, 허니팟 필드(`website`)가 비어 있어야 함
+- 요청 제한: 동일 IP 기준 **10분당 3회**, 초과 시 `429 Too Many Requests` + `Retry-After`
+- CORS: 프론트 도메인만 허용
+
+### 5.3 관리자 API (`/admin/**`, JWT 필요)
+
+| Method | Path | 설명 |
+|---|---|---|
+| POST | `/auth/login` | 아이디/비밀번호 → Access Token(30분) 발급, 로그인 실패 5회 시 15분 잠금 |
+| PUT | `/admin/profile` | 프로필 수정 |
+| POST / PUT / DELETE | `/admin/experiences[/{id}]` | 경력 CRUD |
+| POST / PUT / DELETE | `/admin/projects[/{id}]` | 프로젝트 CRUD |
+| POST / PUT / DELETE | `/admin/skills[/{id}]` | 스킬 CRUD |
+| GET | `/admin/contacts?status=&page=&size=` | 연락 메시지 목록 (페이지네이션) |
+| PATCH | `/admin/contacts/{id}` | 상태 변경 (READ / ARCHIVED) |
+
+- 콘텐츠 변경 성공 시 → 캐시 evict + Next.js 재검증 요청 (실패 시 3회 재시도 후 경고 로그, 관리자 API 응답 자체는 성공 처리)
+- Swagger UI: `/swagger-ui` — 공개 API 그룹만 기본 노출, 관리자 API는 운영 환경에서 숨김
+
+### 5.4 운영
+
+| Path | 공개 여부 |
+|---|---|
+| `/actuator/health` | 공개 (헬스체크용) |
+| `/actuator/info`, `/actuator/metrics` | 내부망/관리자만 |
+
+## 6. 프론트엔드 명세
+
+### 6.1 페이지
 
 | 경로 | 렌더링 | 내용 |
 |---|---|---|
-| `/` | SSG | 단일 페이지 섹션: Hero → About → Experience → Projects → Skills → Contact |
-| `/projects/[slug]` | SSG (`generateStaticParams`) | 프로젝트 상세 |
-| `/resume.pdf` | 정적 파일 | 이력서 |
-| `/sitemap.xml`, `/robots.txt` | 빌드 생성 | SEO |
-| 기타 | `not-found.tsx` | 404 페이지 (홈으로 이동 링크) |
+| `/` | SSG + ISR (태그 재검증) | Hero → About → Experience → Projects → Skills → Contact |
+| `/projects/[slug]` | SSG (`generateStaticParams`) + ISR | 프로젝트 상세 |
+| `/about-this-site` | SSG | 사이트 아키텍처 다이어그램, 기술 선택 이유, GitHub·Swagger 링크 (F-15) |
+| `/api/revalidate` | Route Handler | 백엔드 전용, `x-revalidate-secret` 헤더 검증 후 `revalidateTag` |
+| 그 외 | `not-found.tsx` | 404 |
 
-- 헤더 내비게이션: 섹션 앵커 링크(`/#about`, `/#projects` …), 현재 섹션 하이라이트
-- 모바일(< 768px): 햄버거 메뉴
+- `fetch(..., { next: { tags: ['projects'] } })`처럼 리소스별 태그 지정 → 관리자 수정 시 해당 태그만 재검증
+- 백엔드 장애 시 마지막으로 생성된 페이지를 계속 제공
 
-## 4. 데이터 모델
+### 6.2 주요 컴포넌트
 
-```ts
-// src/lib/schema.ts
-export const ProfileSchema = z.object({
-  name: z.string(),
-  role: z.string(),                 // 예: "Frontend Engineer"
-  headline: z.string(),             // 한 줄 소개
-  keywords: z.array(z.string()).length(3),
-  about: z.string(),                // Markdown
-  email: z.string().email(),
-  links: z.object({
-    github: z.string().url(),
-    linkedin: z.string().url().optional(),
-    blog: z.string().url().optional(),
-  }),
-  resumePath: z.string().default("/resume.pdf"),
-});
-
-export const ExperienceSchema = z.object({
-  company: z.string(),
-  role: z.string(),
-  startDate: z.string(),            // "YYYY-MM"
-  endDate: z.string().nullable(),   // null = 재직 중
-  summary: z.string(),
-  achievements: z.array(z.string()), // 수치 포함 성과
-  techStack: z.array(z.string()),
-});
-
-export const SkillGroupSchema = z.object({
-  category: z.enum(["Frontend", "Backend", "Infra", "Collaboration"]),
-  items: z.array(z.object({
-    name: z.string(),
-    description: z.string(),        // 사용 경험 서술 (숙련도 % 바 사용 안 함)
-  })),
-});
-
-// content/projects/<slug>.mdx frontmatter
-export const ProjectFrontmatterSchema = z.object({
-  title: z.string(),
-  summary: z.string(),              // 카드용 1~2문장
-  period: z.string(),               // "2024.03 – 2024.08"
-  role: z.string(),                 // 예: "프론트엔드 리드 (3인 팀)"
-  techStack: z.array(z.string()),
-  thumbnail: z.string(),
-  metrics: z.array(z.object({       // 결과 지표 하이라이트
-    label: z.string(),              // 예: "LCP"
-    before: z.string().optional(),
-    after: z.string(),
-  })).default([]),
-  links: z.object({
-    github: z.string().url().optional(),
-    demo: z.string().url().optional(),
-  }).default({}),
-  featured: z.boolean().default(false),
-  order: z.number(),
-});
-```
-
-프로젝트 MDX 본문은 다음 섹션(H2)을 권장 템플릿으로 한다:
-`개요` / `문제 정의` / `나의 역할` / `기술적 의사결정` / `트러블슈팅` / `결과` / `회고`
-
-- 빌드 시 Zod 검증 실패 → **빌드 실패** 처리 (잘못된 콘텐츠의 배포 방지)
-
-## 5. 컴포넌트 명세 (주요)
-
-| 컴포넌트 | 기능 ID | 동작 |
+| 컴포넌트 | 기능 | 동작 |
 |---|---|---|
-| `Hero` | F-01 | 이름/역할/헤드라인/키워드 표시, CTA 버튼 2개(이력서 다운로드 `download` 속성, 연락하기 `#contact`) |
-| `About` | F-02 | Markdown 렌더링 |
-| `ExperienceTimeline` | F-03 | 최신순 정렬, 재직 중이면 "현재" 표시, 기간(n년 m개월) 자동 계산 |
-| `ProjectList` | F-04 | `order` 오름차순 정렬, 기술 태그 필터(다중 선택 = OR 조건, "전체" 초기화), 필터 상태 URL 쿼리(`?tag=react`) 동기화 |
-| `ProjectCard` | F-04 | 썸네일, 제목, 요약, 태그, 상세 링크 |
-| `ProjectDetail` | F-05 | frontmatter 헤더 + 지표 하이라이트 + MDX 본문 + 이전/다음 프로젝트 링크 |
-| `Skills` | F-06 | 카테고리별 그룹 |
-| `Contact` | F-07 | mailto 링크, 외부 링크는 `target="_blank" rel="noopener noreferrer"` |
-| `Header` / `MobileNav` | F-09 | sticky 헤더, 모바일 메뉴 열림 시 포커스 트랩 + ESC 닫기 |
+| `Hero` | F-01 | 이름/역할/헤드라인/키워드, CTA 2개(이력서 `download`, 연락 `#contact`) |
+| `ExperienceTimeline` | F-03 | 최신순, 재직 중이면 "현재", 기간(n년 m개월) 자동 계산 |
+| `ProjectList` | F-04 | 태그 필터(다중 = OR, "전체" 초기화), URL 쿼리(`?tag=spring`) 동기화, 결과 0건 메시지 |
+| `ProjectDetail` | F-05 | 헤더 + 지표 하이라이트(전→후) + Markdown 본문 + 이전/다음 링크 |
+| `SkillBar` | F-06 | 아래 6.3 참고 |
+| `ContactForm` | F-11 | 클라이언트 검증 → POST, 제출 중 버튼 비활성화, 성공/429/오류 메시지 |
+| `Header` / `MobileNav` | F-09 | sticky 헤더, 모바일 메뉴 포커스 트랩 + ESC 닫기 |
 
-## 6. 디자인 가이드
+### 6.3 기술 숙련도 막대 (F-06)
 
-- 레이아웃: 최대 폭 960px 중앙 정렬, 섹션 간 여백 일관(디자인 토큰)
+- 5단계 막대(5칸 세그먼트) + 단계명 + 한 줄 사용 경험
+- 단계 기준 (사이트에 범례로 표기):
+
+| 단계 | 이름 | 기준 |
+|---|---|---|
+| 1 | 학습 | 학습·토이 프로젝트 경험 |
+| 2 | 기초 | 도움을 받아 기능 구현 가능 |
+| 3 | 실무 | 실무에서 독립적으로 기능 개발·운영 |
+| 4 | 숙련 | 설계 결정, 성능·장애 문제 해결 경험 |
+| 5 | 전문 | 팀 내 기준 수립, 리뷰·멘토링 가능 |
+
+- 접근성: `role="meter"`, `aria-valuemin=1`, `aria-valuemax=5`, `aria-valuenow`, `aria-label="Spring Boot 숙련도 4/5 (숙련)"` — 색만으로 정보 전달하지 않도록 단계명 텍스트 병기
+- 애니메이션: 화면 진입 시 채워지는 효과, `prefers-reduced-motion`이면 생략
+
+### 6.4 디자인 가이드
+
+- 최대 폭 960px 중앙 정렬, 디자인 토큰으로 여백·색 일관 유지
 - 브레이크포인트: `sm 640` / `md 768` / `lg 1024` / `xl 1280`
-- 폰트: Pretendard (한글), 서브셋 + `next/font/local`
+- 폰트: Pretendard(한글) + JetBrains Mono(코드), `next/font/local` 서브셋
 - 컬러: 중립 배경 + 포인트 컬러 1개, 본문 대비 4.5:1 이상
-- 모션: `prefers-reduced-motion` 존중, 스크롤 페이드인 정도로 최소화
 
-## 7. SEO / 메타데이터 (F-10)
+### 6.5 SEO (F-10)
 
-- `layout.tsx`에서 `metadata` 기본값(title template, description, `metadataBase`)
-- 프로젝트 상세는 `generateMetadata`로 개별 title/description/OG
-- `opengraph-image.tsx`로 OG 이미지 동적 생성 (1200×630)
-- JSON-LD `Person` 스키마 삽입
-- `sitemap.ts`: 홈 + 모든 프로젝트 상세
+- `metadata` 기본값(title template, description, `metadataBase`), 상세는 `generateMetadata`
+- `opengraph-image.tsx` (1200×630), JSON-LD `Person`, `sitemap.ts`(홈 + 모든 프로젝트), `robots.ts`
+
+## 7. 보안 설계
+
+| 항목 | 내용 |
+|---|---|
+| 인증 | `/auth/login` → JWT(HS256, 30분). 서명 키는 환경 변수 `JWT_SECRET` (256bit 이상) |
+| 인가 | `/api/v1/admin/**` → `ROLE_ADMIN`, 나머지 공개 GET + `POST /contacts` 허용 |
+| 비밀번호 | BCrypt, 로그인 실패 5회 → 15분 잠금 |
+| CORS | `https://<domain>`(프로덕션), `http://localhost:3000`(로컬)만 허용 |
+| 입력 | Bean Validation, Markdown 렌더링 시 raw HTML 비허용(XSS 방지) |
+| 스팸 | Bucket4j IP 요청 제한 + 허니팟 필드 |
+| 비밀값 | `.env`·GitHub Secrets·서버 환경 변수, 저장소에 커밋 금지 |
+| 전송 | HTTPS 강제 (Nginx + Let's Encrypt) |
 
 ## 8. 성능 설계
 
-- 전 페이지 SSG, 클라이언트 컴포넌트는 필터·모바일 메뉴 등 상호작용 부분으로 한정
-- 이미지: `next/image`, WebP/AVIF, 명시적 width/height (CLS 방지), Hero 이미지만 `priority`
-- 서드파티 스크립트 최소화 (분석 도구는 P1에서 `afterInteractive`로 로드)
-- 번들 예산: 홈 First Load JS < 120KB (gzip)
+- **프론트**: 전 페이지 SSG/ISR, 클라이언트 컴포넌트는 필터·메뉴·폼으로 한정, `next/image`, 홈 First Load JS < 120KB(gzip)
+- **API**: 공개 조회 결과 Caffeine 캐시(TTL 10분, 관리자 수정 시 evict), N+1 방지, 페이지네이션은 관리자 목록에만 적용
+- **DB**: `project.slug` UNIQUE 인덱스, `contact_message(status, created_at)` 복합 인덱스
+- **검증**: k6로 공개 API p95 < 200ms 확인 (부하 테스트 결과를 F-15 페이지에 게시)
 
 ## 9. 테스트 전략
 
-### 9.1 단위 테스트 (Vitest + RTL)
-| 대상 | 검증 내용 |
+### 9.1 백엔드
+
+| 종류 | 도구 | 대상 |
+|---|---|---|
+| 단위 | JUnit 5 + Mockito + AssertJ | Service 로직(정렬, 기간 계산, 상태 변경, 요청 제한 판정) |
+| 영속성 | `@DataJpaTest` + Testcontainers(MySQL) | Repository 쿼리, fetch join, 태그 필터 쿼리, Flyway 마이그레이션 적용 |
+| 웹 계층 | `@WebMvcTest` | 요청 검증, 에러 응답 포맷(ProblemDetail), 인증·인가(401/403) |
+| 통합 | `@SpringBootTest` + Testcontainers | 로그인 → 관리자 CRUD → 공개 API 반영, 연락 폼 429 시나리오, 재검증 이벤트 발행 |
+| 커버리지 | JaCoCo | line 80% 미만이면 빌드 실패 |
+
+### 9.2 프론트엔드
+
+| 종류 | 대상 |
 |---|---|
-| `lib/schema.ts` | 유효/무효 frontmatter 파싱 결과 |
-| `lib/content.ts` | 프로젝트 목록 정렬, slug 조회, 없는 slug 처리 |
-| 기간 계산 유틸 | 재직 중/종료, 월 경계 계산 |
-| `ProjectList` | 태그 필터 선택/해제/초기화, 결과 0건 메시지 |
-| `MobileNav` | 열기/닫기, ESC, 포커스 트랩 |
+| 단위 (Vitest + RTL) | 기간 계산 유틸, `ProjectList` 필터, `SkillBar` aria 속성, `ContactForm` 검증·상태별 메시지, `MobileNav` |
+| E2E (Playwright, Desktop Chrome + Mobile Safari 뷰포트) | ① 홈 섹션 표시·앵커 이동 ② 이력서 PDF 200 응답 ③ 태그 필터 → URL 반영 → 새로고침 유지 ④ 상세 이동·이전/다음 ⑤ 연락 폼 성공/검증 오류 ⑥ 404 ⑦ 모바일 메뉴, 가로 스크롤 없음 ⑧ axe 위반 0건 |
+| 품질 게이트 | Lighthouse CI 4개 카테고리 각 95점 미만이면 실패 |
 
-### 9.2 E2E 테스트 (Playwright — Desktop Chrome, Mobile Safari 뷰포트)
-1. 홈 로드 → 모든 섹션 표시, 헤더 내비게이션 앵커 이동
-2. 이력서 다운로드 링크가 200 응답의 PDF를 가리킴
-3. 프로젝트 태그 필터 → 카드 수 변화 → URL 쿼리 반영 → 새로고침 후 유지
-4. 프로젝트 카드 클릭 → 상세 페이지 → 이전/다음 이동
-5. 존재하지 않는 경로 → 404 페이지
-6. 모바일 뷰포트에서 햄버거 메뉴 동작, 가로 스크롤 없음
-7. `@axe-core/playwright`로 주요 페이지 접근성 위반 0건
+- E2E는 Docker Compose로 백엔드+MySQL(시드 데이터)을 띄운 상태에서 실행
 
-### 9.3 품질 게이트
-- Lighthouse CI: 4개 카테고리 각 95점 미만이면 CI 실패
-- 커버리지 목표: `lib/` 90% 이상, 컴포넌트 70% 이상
+## 10. 배포 및 CI/CD
 
-## 10. CI/CD 및 배포
+### 10.1 인프라 `[가정: 기본안, 확인 필요]`
+
+| 구성 | 기본안 | 대안 |
+|---|---|---|
+| 프론트 | Vercel | — |
+| 백엔드 | AWS EC2(t4g.small) 1대 — Docker + Nginx(TLS) | AWS Lightsail, Railway, Fly.io |
+| DB | AWS RDS for MySQL 8.4 (db.t4g.micro) | 같은 EC2의 MySQL 컨테이너(비용 절감, 백업 직접 관리) |
+| 이미지 저장소 | GitHub Container Registry(GHCR) | Amazon ECR |
+| DNS | 도메인 등록 업체 또는 Route 53 | |
+
+### 10.2 파이프라인
 
 ```
-PR 생성/갱신
-  └─ GitHub Actions: install → lint → typecheck → unit test → build → E2E → Lighthouse CI
-  └─ Vercel: Preview 배포 (PR 코멘트로 URL)
+PR
+ ├─ backend-ci  : Gradle build → 테스트(Testcontainers) → JaCoCo 검사
+ └─ frontend-ci : install → lint → typecheck → unit → build → E2E → Lighthouse CI
+                  + Vercel Preview 배포
+
 main 머지
-  └─ Vercel: Production 배포
+ ├─ backend-deploy : Docker 이미지 빌드 → GHCR push → EC2 SSH 접속
+ │                   → 새 컨테이너 기동 → /actuator/health 확인 → 이전 컨테이너 종료
+ │                   (헬스체크 실패 시 이전 이미지로 롤백)
+ └─ Vercel Production 배포
 ```
 
 - 브랜치 전략: `main`(배포) + 기능 브랜치 → PR → 머지
-- 환경 변수: MVP에서는 불필요 (`NEXT_PUBLIC_SITE_URL`만 사용)
-- 도메인: 기본 `*.vercel.app`, 커스텀 도메인은 확정 시 연결 `[가정]`
+- DB 마이그레이션: 애플리케이션 기동 시 Flyway 자동 적용 (하위 호환되는 변경만 허용)
 
-## 11. 개발 작업 순서 (개발 단계 계획)
+### 10.3 환경 변수
 
-1. 프로젝트 초기화 (Next.js, TS, Tailwind, ESLint/Prettier, Vitest, Playwright)
-2. 스키마·콘텐츠 로더 + 더미 콘텐츠
-3. 레이아웃(Header/Footer/MobileNav) + 디자인 토큰
-4. 홈 섹션 (Hero → About → Experience → Skills → Contact)
-5. 프로젝트 목록·필터·상세
-6. SEO(메타데이터, OG, sitemap, JSON-LD), 404
-7. 테스트 작성 및 Lighthouse 최적화
-8. CI 구성 → Vercel 연결 → 배포
+| 이름 | 위치 | 용도 |
+|---|---|---|
+| `DB_URL`, `DB_USERNAME`, `DB_PASSWORD` | 백엔드 | MySQL 접속 |
+| `JWT_SECRET` | 백엔드 | JWT 서명 |
+| `ADMIN_USERNAME`, `ADMIN_PASSWORD` | 백엔드 | 최초 관리자 생성 |
+| `CORS_ALLOWED_ORIGINS` | 백엔드 | CORS |
+| `REVALIDATE_URL`, `REVALIDATE_SECRET` | 백엔드 | Next.js 재검증 요청 |
+| `IP_HASH_SALT` | 백엔드 | 연락 폼 IP 해시 |
+| `API_BASE_URL` | 프론트(서버) | 빌드·재검증 시 API 호출 |
+| `NEXT_PUBLIC_API_BASE_URL` | 프론트(브라우저) | 연락 폼 POST |
+| `REVALIDATE_SECRET` | 프론트 | 재검증 요청 검증 |
+| `NEXT_PUBLIC_SITE_URL` | 프론트 | 메타데이터 기준 URL |
+
+## 11. 개발 작업 순서
+
+1. 모노레포 초기화, `docker-compose.yml`(MySQL), 백엔드 Spring Boot 프로젝트 생성(Gradle, Java 25)
+2. Flyway 스키마(V1) + 더미 시드(V2), JPA 엔티티·Repository
+3. 공개 조회 API + 공통 예외 처리(ProblemDetail) + 캐시 + Swagger
+4. 연락 폼 API + 요청 제한
+5. Spring Security + JWT 로그인 + 관리자 CRUD API + 재검증 이벤트
+6. 백엔드 테스트(단위·슬라이스·통합) + JaCoCo
+7. Next.js 프로젝트 생성, OpenAPI 타입 생성, 레이아웃·디자인 토큰
+8. 홈 섹션(Hero → About → Experience → Skills(막대) → Contact 폼)
+9. 프로젝트 목록·필터·상세, `/about-this-site`, SEO, 404, `/api/revalidate`
+10. 프론트 테스트(단위·E2E·Lighthouse)
+11. CI 구성 → 인프라 구성 → 배포 → 도메인·HTTPS 연결
 
 ## 12. 확인이 필요한 사항
 
-1. 기술 스택(Next.js / Tailwind / Vercel) 확정 여부
-2. 홈을 단일 페이지(섹션 스크롤)로 구성하는 방식에 동의하는지
-3. 기술 스택 숙련도를 % 바 대신 "사용 경험 서술"로 표현하는 방식에 동의하는지
-4. 프로젝트 상세 본문 템플릿(7개 섹션) 수정 여부
+1. 배포 인프라 기본안(프론트 Vercel / 백엔드 AWS EC2 + RDS) 동의 여부, 혹은 비용을 줄이기 위해 DB를 EC2 컨테이너로 운영할지
+2. 관리자 기능을 MVP에서는 **API + Swagger로만** 제공하고 관리자 화면은 차기(F-20)로 미루는 방식에 동의하는지
+3. 숙련도 5단계 기준(6.3절) 문구 수정 여부
+4. 빌드 도구 Gradle(Kotlin DSL) 사용 여부 (Maven 선호 시 변경)
